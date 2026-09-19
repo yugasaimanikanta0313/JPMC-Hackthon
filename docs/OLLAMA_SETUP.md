@@ -1,8 +1,7 @@
 # Ollama setup
 
 ```powershell
-ollama pull qwen3:1.7b
-ollama pull qwen3:0.6b
+ollama pull qwen2.5:0.5b
 ollama serve
 ```
 
