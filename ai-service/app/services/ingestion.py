@@ -41,10 +41,17 @@ def safe_archive_entry(info,max_file_size=2_000_000):
 def antivirus_scan(data:bytes):
     executable=shutil.which("clamscan")
     if executable:
-        result=subprocess.run([executable,"--no-summary","-"],input=data,capture_output=True,timeout=90)
-        if result.returncode==1:raise ValueError("Malware detected in uploaded archive")
-        if result.returncode>1:raise ValueError("Antivirus scan failed")
-        return {"status":"CLEAN","engine":"ClamAV"}
+        temporary=None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False,suffix=".zip") as handle:handle.write(data);temporary=handle.name
+            result=subprocess.run([executable,"--no-summary",temporary],capture_output=True,timeout=90)
+            if result.returncode==1:raise ValueError("Malware detected in uploaded archive")
+            if result.returncode>1:raise ValueError("Antivirus scan failed")
+            return {"status":"CLEAN","engine":"ClamAV"}
+        except subprocess.TimeoutExpired as exc:
+            raise ValueError("Antivirus scan timed out; ZIP upload was rejected") from exc
+        finally:
+            if temporary:Path(temporary).unlink(missing_ok=True)
     defender=Path(r"C:\Program Files\Windows Defender\MpCmdRun.exe")
     if defender.exists():
         temporary=None
