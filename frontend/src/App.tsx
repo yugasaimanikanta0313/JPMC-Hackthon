@@ -17,6 +17,7 @@ import {
   Send,
   RefreshCw,
   CheckCircle2,
+  Trash2,
 } from "lucide-react";
 import {
   ForgotPassword,
@@ -324,7 +325,8 @@ function Projects({ auth }: { auth: Auth }) {
     [selected, setSelected] = useState<Project | null>(null),
     [work, setWork] = useState<Work[]>([]),
     [show, setShow] = useState(false),
-    [editing, setEditing] = useState<Project | null>(null);
+    [editing, setEditing] = useState<Project | null>(null),
+    [error, setError] = useState("");
   const load = async () => {
     const list = await api<Project[]>("/projects");
     setP(list);
@@ -395,15 +397,35 @@ function Projects({ auth }: { auth: Auth }) {
           />
           {selected ? (
             <>
-              <button
-                className="secondary"
-                onClick={() => {
-                  setEditing(selected);
-                  setShow(true);
-                }}
-              >
-                Edit all project details
-              </button>
+              <div className="project-actions">
+                <button
+                  className="secondary"
+                  onClick={() => {
+                    setEditing(selected);
+                    setShow(true);
+                  }}
+                >
+                  Edit all project details
+                </button>
+                <button
+                  className="danger-button"
+                  onClick={async () => {
+                    if (!confirm(`Delete “${selected.name}” and all of its tickets, uploads, and RAG knowledge? This cannot be undone.`)) return;
+                    try {
+                      setError("");
+                      await api("/projects/" + selected.id, { method: "DELETE" });
+                      setSelected(null);
+                      setWork([]);
+                      await load();
+                    } catch (err) {
+                      setError(err instanceof Error ? err.message : "Project deletion failed");
+                    }
+                  }}
+                >
+                  <Trash2 size={16} /> Delete project
+                </button>
+              </div>
+              {error && <div className="form-error">{error}</div>}
               <button
                 className="secondary"
                 onClick={async () => {

@@ -192,6 +192,23 @@ def edit_project(pid:str,x:Project,u=Depends(roles("student","core_admin"))):
  update={**x.model_dump(),"updated_at":now()};db.projects.update_one({"_id":current["_id"]},{"$set":update})
  chunk_document(db,pid,f"project:{pid}",x.name,"\n".join([x.summary,x.requirement_analysis,*x.expected_deliverables,*x.acceptance_criteria]),"requirements",True,repository=x.repository_url,access_scope="project")
  return clean({**current,**update})
+@app.delete("/api/v1/projects/{pid}",status_code=204)
+def delete_project(pid:str,u=Depends(roles("student","core_admin"))):
+ project_doc=db.projects.find_one({"_id":oid(pid)})
+ if not project_doc:raise HTTPException(404,"Project not found")
+ if u["role"]!="core_admin" and project_doc.get("created_by")!=str(u["_id"]):raise HTTPException(403,"Students may delete only projects they created")
+ # Remove uploaded objects before deleting their metadata. A project deletion is
+ # intentionally cascading so its private evidence cannot remain retrievable.
+ for ticket_doc in db.tickets.find({"project_id":pid},{"artifacts.files":1}):
+  for item in ticket_doc.get("artifacts",{}).get("files",[]):
+   try:
+    if item.get("s3_key") and s3():s3().delete_object(Bucket=item.get("s3_bucket") or s.aws_s3_bucket,Key=item["s3_key"])
+    elif item.get("storage_path"):Path(item["storage_path"]).unlink(missing_ok=True)
+   except Exception:pass
+ for collection in (db.project_members,db.requirements,db.documents,db.questions,db.decisions,db.escalations,db.knowledge,db.issues,db.tasks,db.work,db.tickets,db.question_attempts,db.document_chunks,db.repository_syncs):
+  collection.delete_many({"project_id":pid})
+ db.projects.delete_one({"_id":project_doc["_id"]})
+ return None
 @app.post("/api/v1/projects/{pid}/members")
 def member(pid:str,x:dict,u=Depends(roles("core_admin"))):db.project_members.update_one({"project_id":pid,"user_id":x["user_id"]},{"$set":{**x,"project_id":pid,"active":True}},upsert=True);return {"status":"added"}
 def routes(name):
