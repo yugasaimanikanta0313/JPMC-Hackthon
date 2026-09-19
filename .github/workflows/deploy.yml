@@ -56,6 +56,9 @@ jobs:
             cd /opt/barabari
             git fetch origin master
             git checkout master
+            if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+              git stash push -m "pre-deploy-$(date -u +%Y%m%dT%H%M%SZ)"
+            fi
             git pull --ff-only origin master
             test -f .env
             docker compose -f docker-compose.prod.yml up -d --build --remove-orphans
