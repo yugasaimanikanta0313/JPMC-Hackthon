@@ -21,9 +21,9 @@ from app.models.schemas import AskRequest,IngestRequest
 from app.rag.rag_service import RagService
 from app.retrieval.hybrid_retriever import Chunk,HybridRetriever
 from app.services.github_app import GitHubAppClient
-from app.services.ingestion import antivirus_scan,safe_archive_entry,chunk_document,analyze_image
+from app.services.ingestion import antivirus_scan,safe_archive_entry,chunk_document,analyze_image,configure_embeddings
 
-s=get_settings();mongo=MongoClient(s.mongodb_uri,serverSelectionTimeoutMS=8000);db=mongo.get_default_database()
+s=get_settings();configure_embeddings(s.gemini_api_key,s.gemini_embedding_model);mongo=MongoClient(s.mongodb_uri,serverSelectionTimeoutMS=8000);db=mongo.get_default_database()
 app=FastAPI(title="Barabari Unified API",version="1.0",docs_url="/api/docs")
 app.add_middleware(CORSMiddleware,allow_origins=[s.frontend_url,"http://localhost:5173"],allow_credentials=True,allow_methods=["*"],allow_headers=["*"])
 rag=RagService(HybridRetriever([],db),s);github_app=GitHubAppClient(s)

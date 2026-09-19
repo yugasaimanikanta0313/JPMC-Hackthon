@@ -8,20 +8,29 @@ from datetime import datetime,timezone
 from pathlib import PurePosixPath
 
 import httpx
-from functools import lru_cache
+import math
+import re
 
 TEXT_SUFFIXES={".txt",".md",".py",".js",".jsx",".ts",".tsx",".java",".go",".rs",".cs",".php",".rb",".json",".yaml",".yml",".toml",".xml",".html",".css",".scss",".sql",".sh",".ps1",".log"}
 EXCLUDED_PARTS={"node_modules","vendor","dist","build","target","coverage",".git",".next","__pycache__","generated"}
 LANGUAGE_ALIASES={"py":"python","js":"javascript","jsx":"javascript","ts":"typescript","tsx":"tsx","java":"java","go":"go","rs":"rust","cs":"c_sharp","php":"php","rb":"ruby","html":"html","css":"css","json":"json","yaml":"yaml","yml":"yaml","sql":"sql","sh":"bash"}
 
-@lru_cache(maxsize=2)
-def embedding_model(name):
-    from sentence_transformers import SentenceTransformer
-    return SentenceTransformer(name)
+_embedding_key="";_embedding_model="gemini-embedding-001"
+def configure_embeddings(api_key,model="gemini-embedding-001"):
+    global _embedding_key,_embedding_model
+    _embedding_key=api_key or "";_embedding_model=model
 
-def embedding(text,model_name="BAAI/bge-small-en-v1.5"):
-    try:return embedding_model(model_name).encode(text[:8000],normalize_embeddings=True).tolist()
-    except Exception:return None
+def embedding(text,model_name=None,task_type="RETRIEVAL_DOCUMENT"):
+    if _embedding_key:
+        try:
+            model=model_name if model_name and model_name.startswith("gemini-") else _embedding_model
+            response=httpx.post(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:embedContent?key={_embedding_key}",json={"model":f"models/{model}","content":{"parts":[{"text":text[:12000]}]},"taskType":task_type,"outputDimensionality":384},timeout=45)
+            response.raise_for_status();return response.json()["embedding"]["values"]
+        except Exception:pass
+    vector=[0.0]*384
+    for word in re.findall(r"[a-z0-9_./-]+",text.lower()):vector[int(hashlib.sha256(word.encode()).hexdigest()[:8],16)%384]+=1.0
+    norm=math.sqrt(sum(v*v for v in vector)) or 1.0
+    return [v/norm for v in vector]
 
 def safe_archive_entry(info,max_file_size=2_000_000):
     path=PurePosixPath(info.filename.replace("\\","/"))

@@ -3,8 +3,6 @@ uvicorn[standard]==0.37.0
 pydantic-settings==2.11.0
 httpx==0.28.1
 pymongo==4.15.1
-sentence-transformers==5.1.1
-langchain-core==0.3.76
 pytest==8.4.2
 PyJWT==2.10.1
 bcrypt==4.2.1

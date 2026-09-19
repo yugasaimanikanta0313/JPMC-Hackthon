@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     gemini_model: str = "gemini-2.5-flash"
     google_cloud_vision_api_key: str = ""
     embedding_model: str = "BAAI/bge-small-en-v1.5"
+    gemini_embedding_model: str = "gemini-embedding-001"
     model_config = SettingsConfigDict(env_file="../.env", extra="ignore", case_sensitive=False)
 
 @lru_cache

@@ -22,7 +22,7 @@ class HybridRetriever:
     def search(self,project_id,query,limit=8):
         terms=set(re.findall(r"[a-z0-9_./-]+",query.lower()));scored=[]
         if self.db is not None:
-            vector=embedding(query)
+            vector=embedding(query,task_type="RETRIEVAL_QUERY")
             if vector:
                 try:
                     rows=list(self.db.document_chunks.aggregate([{"$vectorSearch":{"index":"project_vector_index","path":"embedding","queryVector":vector,"numCandidates":100,"limit":limit,"filter":{"project_id":project_id}}},{"$match":{"verified":True}},{"$set":{"vector_score":{"$meta":"vectorSearchScore"}}}]))
