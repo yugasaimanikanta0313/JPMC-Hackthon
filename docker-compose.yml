@@ -1,0 +1,27 @@
+services:
+  mongodb:
+    image: mongo:8.0
+    ports: ["27017:27017"]
+    volumes: ["barabari-mongo:/data/db"]
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  backend:
+    build: ./backend
+    env_file: .env
+    ports: ["8080:8080"]
+    depends_on:
+      mongodb: { condition: service_healthy }
+  ai-service:
+    build: ./ai-service
+    env_file: .env
+    ports: ["8000:8000"]
+  frontend:
+    build: ./frontend
+    ports: ["5173:80"]
+    depends_on: [backend, ai-service]
+volumes:
+  barabari-mongo:
+

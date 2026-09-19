@@ -1,0 +1,4 @@
+package org.barabari.mentoring.service;
+import io.jsonwebtoken.*;import io.jsonwebtoken.security.Keys;import java.nio.charset.StandardCharsets;import java.time.Instant;import java.util.*;import javax.crypto.SecretKey;import org.springframework.core.env.Environment;import org.springframework.stereotype.Service;
+@Service public class JwtService {private final SecretKey key;public JwtService(Environment e){String s=e.getProperty("app.jwt-secret","local-development-secret-change-before-deployment");key=Keys.hmacShaKeyFor(Arrays.copyOf(s.getBytes(StandardCharsets.UTF_8),32));}public String create(String id,String email,String role,long seconds,String type){var n=Instant.now();return Jwts.builder().subject(id).claim("email",email).claim("role",role).claim("type",type).issuedAt(Date.from(n)).expiration(Date.from(n.plusSeconds(seconds))).signWith(key).compact();}public Claims parse(String t){return Jwts.parser().verifyWith(key).build().parseSignedClaims(t).getPayload();}}
+

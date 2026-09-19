@@ -1,0 +1,32 @@
+spring:
+  application.name: barabari-backend
+  data.mongodb:
+    uri: ${MONGODB_URI:mongodb://localhost:27017/barabari}
+    auto-index-creation: true
+  mail:
+    host: ${SMTP_HOST:localhost}
+    port: ${SMTP_PORT:1025}
+    username: ${SMTP_USERNAME:}
+    password: ${SMTP_PASSWORD:}
+    properties:
+      mail.smtp.auth: ${SMTP_AUTH:true}
+      mail.smtp.starttls.enable: ${SMTP_STARTTLS:true}
+      mail.smtp.starttls.required: ${SMTP_STARTTLS:true}
+    test-connection: false
+  security.oauth2.client.registration:
+    google:
+      client-id: ${GOOGLE_CLIENT_ID:disabled}
+      client-secret: ${GOOGLE_CLIENT_SECRET:disabled}
+    github:
+      client-id: ${GITHUB_CLIENT_ID:disabled}
+      client-secret: ${GITHUB_CLIENT_SECRET:disabled}
+management.endpoints.web.exposure.include: health,info
+server.error.include-stacktrace: never
+app:
+  frontend-url: ${FRONTEND_URL:http://localhost:5173}
+  mail-from: ${SMTP_FROM:${SMTP_USERNAME:no-reply@barabari.local}}
+  jwt-secret: ${JWT_SECRET:local-development-secret-change-before-deployment}
+  bootstrap-admin:
+    name: ${BOOTSTRAP_ADMIN_NAME:Barabari Administrator}
+    email: ${BOOTSTRAP_ADMIN_EMAIL:admin@barabari.local}
+    password: ${BOOTSTRAP_ADMIN_PASSWORD:ChangeMe123!}

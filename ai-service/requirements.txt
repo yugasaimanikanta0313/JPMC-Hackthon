@@ -1,0 +1,17 @@
+fastapi==0.117.1
+uvicorn[standard]==0.37.0
+pydantic-settings==2.11.0
+httpx==0.28.1
+pymongo==4.15.1
+sentence-transformers==5.1.1
+langchain-core==0.3.76
+pytest==8.4.2
+PyJWT==2.10.1
+bcrypt==4.2.1
+python-multipart==0.0.20
+email-validator==2.2.0
+pypdf==6.1.1
+boto3==1.40.45
+cryptography==46.0.1
+tree-sitter==0.25.2
+tree-sitter-language-pack==1.20.0

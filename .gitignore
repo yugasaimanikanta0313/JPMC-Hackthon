@@ -1,0 +1,16 @@
+.env
+CREDENTIALS_TO_CONFIGURE.txt
+*.log
+.idea/
+.vscode/settings.json
+node_modules/
+dist/
+target/
+.venv/
+__pycache__/
+.pytest_cache/
+storage/local/*
+!storage/local/.gitkeep
+*.pem
+*.key
+.env.production
