@@ -5,14 +5,13 @@ from io import BytesIO
 from pypdf import PdfReader
 from datetime import datetime,timedelta,timezone
 from email.message import EmailMessage
-from urllib.parse import urlencode,urlparse
+from urllib.parse import urlparse
 import bcrypt,httpx,jwt
 import boto3
 from botocore.exceptions import ClientError
 from bson import ObjectId
 from fastapi import FastAPI,HTTPException,Depends,Request,UploadFile,File,Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
 from pydantic import BaseModel,EmailStr,Field
 from pymongo import MongoClient
 from pymongo.operations import SearchIndexModel
@@ -99,7 +98,13 @@ class Invite(BaseModel):
  categories:list[str]=[]
  skills:list[str]=[]
  max_capacity:int=Field(default=5,ge=1,le=50)
-class Accept(BaseModel):name:str;password:str=Field(min_length=10)
+class Accept(BaseModel):
+ name:str
+ password:str=Field(min_length=10)
+ primary_category:str|None=None
+ categories:list[str]=[]
+ skills:list[str]=[]
+ max_capacity:int=Field(default=5,ge=1,le=50)
 class Project(BaseModel):name:str;summary:str="";stakeholder_name:str="";stakeholder_organization:str="";requirement_analysis:str="";expected_deliverables:list[str]=[];acceptance_criteria:list[str]=[];tech_stack:list[str]=[];repository_url:str|None=None
 
 @app.on_event("startup")
@@ -141,7 +146,6 @@ def reset(x:dict):
 @app.post("/api/v1/invitations")
 def invite(x:Invite,u=Depends(roles("core_admin"))):
  if x.role not in ["student","core_reviewer"]:raise HTTPException(400,"Use student or core_reviewer")
- if x.role=="core_reviewer" and (not x.primary_category or not x.categories or not x.skills):raise HTTPException(400,"Core reviewers require a primary category, categories, and skills")
  t=secrets.token_urlsafe(32);token_digest=digest(t);d={**x.model_dump(),"email":x.email.lower(),"token_hash":token_digest,"tokenHash":token_digest,"status":"pending","expires_at":now()+timedelta(days=7),"created_at":now()};r=db.invitations.insert_one(d);email(x.email,"You are invited to Barabari",f"Verify and set your password: {s.frontend_url}/invite/{t}");return clean({"_id":r.inserted_id,**d})
 @app.get("/api/v1/invitations")
 def invites(u=Depends(roles("core_admin"))):return clean(list(db.invitations.find().sort("created_at",-1)))
@@ -154,47 +158,20 @@ def get_invite(t:str):
 def accept(t:str,x:Accept):
  i=db.invitations.find_one({**invitation_token_filter(t),"status":"pending","expires_at":{"$gt":now()}})
  if not i:raise HTTPException(400,"Invitation invalid or expired")
- d={"name":x.name,"email":i["email"],"password_hash":ph(x.password),"role":i["role"],"specialty":i.get("specialty"),"active":True,"email_verified":True,"created_at":now()};r=db.users.insert_one(d);d["_id"]=r.inserted_id
+ specialty=i.get("specialty")
  if i["role"]=="core_reviewer":
-  db.mentor_profiles.update_one({"user_id":str(r.inserted_id)},{"$set":{"user_id":str(r.inserted_id),"name":x.name,"email":i["email"],"primary_category":i.get("primary_category"),"categories":i.get("categories",[]),"skills":i.get("skills",[]),"max_capacity":i.get("max_capacity",5),"current_active_tickets":0,"is_available":True,"total_resolved_tickets":0,"updated_at":now()},"$setOnInsert":{"created_at":now()}},upsert=True)
+  primary_cat=x.primary_category or i.get("primary_category") or "Developer"
+  specialty=primary_cat
+ d={"name":x.name,"email":i["email"],"password_hash":ph(x.password),"role":i["role"],"specialty":specialty,"active":True,"email_verified":True,"created_at":now()};r=db.users.insert_one(d);d["_id"]=r.inserted_id
+ if i["role"]=="core_reviewer":
+  primary_cat=x.primary_category or i.get("primary_category") or "Developer"
+  cats=x.categories if x.categories else (i.get("categories") or [primary_cat])
+  skills_list=x.skills if x.skills else (i.get("skills") or [])
+  cap=x.max_capacity if x.max_capacity else i.get("max_capacity",5)
+  db.mentor_profiles.update_one({"user_id":str(r.inserted_id)},{"$set":{"user_id":str(r.inserted_id),"name":x.name,"email":i["email"],"primary_category":primary_cat,"categories":cats,"skills":skills_list,"max_capacity":cap,"current_active_tickets":0,"is_available":True,"total_resolved_tickets":0,"updated_at":now()},"$setOnInsert":{"created_at":now()}},upsert=True)
  db.invitations.update_one({"_id":i["_id"]},{"$set":{"status":"accepted"}});return auth(d)
 @app.post("/api/v1/invitations/{iid}/revoke")
 def revoke(iid:str,u=Depends(roles("core_admin"))):db.invitations.update_one({"_id":oid(iid)},{"$set":{"status":"revoked"}});return {"status":"revoked"}
-
-@app.get("/api/v1/oauth/{provider}/start")
-def oauth_start(provider:str,invitation:str|None=None):
- state=jwt.encode({"invitation":invitation,"exp":now()+timedelta(minutes=10)},s.jwt_secret,algorithm="HS256");cb=f"{s.backend_url}/login/oauth2/code/{provider}"
- if provider=="google":url="https://accounts.google.com/o/oauth2/v2/auth?"+urlencode({"client_id":s.google_client_id,"redirect_uri":cb,"response_type":"code","scope":"openid email profile","state":state,"prompt":"select_account"})
- elif provider=="github":url="https://github.com/login/oauth/authorize?"+urlencode({"client_id":s.github_client_id,"redirect_uri":cb,"scope":"read:user user:email","state":state})
- else:raise HTTPException(404,"Unknown provider")
- return RedirectResponse(url)
-@app.get("/api/v1/oauth/{provider}/callback",include_in_schema=False)
-@app.get("/login/oauth2/code/{provider}")
-async def callback(provider:str,code:str,state:str):
- try:st=jwt.decode(state,s.jwt_secret,algorithms=["HS256"])
- except:return RedirectResponse(f"{s.frontend_url}/?oauth_error=state")
- cb=f"{s.backend_url}/login/oauth2/code/{provider}"
- async with httpx.AsyncClient(timeout=20) as h:
-  if provider=="google":
-   z=(await h.post("https://oauth2.googleapis.com/token",data={"client_id":s.google_client_id,"client_secret":s.google_client_secret,"code":code,"grant_type":"authorization_code","redirect_uri":cb})).json();p=(await h.get("https://openidconnect.googleapis.com/v1/userinfo",headers={"Authorization":"Bearer "+z.get("access_token","")})).json();mail=p.get("email");name=p.get("name")
-  else:
-   z=(await h.post("https://github.com/login/oauth/access_token",data={"client_id":s.github_client_id,"client_secret":s.github_client_secret,"code":code},headers={"Accept":"application/json"})).json();hd={"Authorization":"Bearer "+z.get("access_token",""),"Accept":"application/vnd.github+json"};p=(await h.get("https://api.github.com/user",headers=hd)).json();es=(await h.get("https://api.github.com/user/emails",headers=hd)).json();mail=next((e["email"] for e in es if e.get("primary") and e.get("verified")),None);name=p.get("name") or p.get("login")
- invitation_token=st.get("invitation");u=None
- if invitation_token:
-  i=db.invitations.find_one({**invitation_token_filter(invitation_token),"status":"pending","expires_at":{"$gt":now()}})
-  if not i or not mail or i["email"]!=mail.lower():return RedirectResponse(f"{s.frontend_url}/invite/{invitation_token}?oauth_error=invited_email_mismatch")
-  u=db.users.find_one({"email":mail.lower()})
-  if not u:
-   d={"name":name,"email":mail.lower(),"role":i["role"],"specialty":i.get("specialty"),"password_hash":None,"active":True,"email_verified":True,"created_at":now()};r=db.users.insert_one(d);d["_id"]=r.inserted_id;u=d
-  db.invitations.update_one({"_id":i["_id"]},{"$set":{"status":"accepted"}})
- else:u=db.users.find_one({"email":mail.lower()}) if mail else None
- if not u:return RedirectResponse(f"{s.frontend_url}/?oauth_error=invitation_required")
- one=secrets.token_urlsafe(24);db.oauth_codes.insert_one({"code":digest(one),"user_id":str(u["_id"]),"expires_at":now()+timedelta(minutes=2)});return RedirectResponse(f"{s.frontend_url}/oauth/callback?code={one}")
-@app.post("/api/v1/oauth/exchange")
-def exchange(x:dict):
- c=db.oauth_codes.find_one_and_delete({"code":digest(x.get("code","")),"expires_at":{"$gt":now()}})
- if not c:raise HTTPException(400,"OAuth code expired")
- return auth(db.users.find_one({"_id":oid(c["user_id"])}))
 
 @app.get("/api/v1/users")
 def users(u=Depends(roles("core_admin"))):return clean(list(db.users.find()))
@@ -360,7 +337,7 @@ def ingest(x:IngestRequest,u=Depends(roles("core_reviewer","core_admin"))):
 @app.get("/api/v1/analytics/overview")
 def analytics(u=Depends(roles("core_reviewer","core_admin"))):return {"activeProjects":db.projects.count_documents({"status":"active"}),"users":db.users.count_documents({}),"openEscalations":db.escalations.count_documents({"status":{"$in":["open","claimed"]}}),"resolvedEscalations":db.escalations.count_documents({"status":{"$in":["resolved","closed"]}})}
 @app.get("/api/v1/integrations")
-def integrations(u=Depends(roles("core_admin"))):return {"mongodb":"CONNECTED","gemini":"ENABLED" if s.gemini_api_key else "NEEDS_CONFIGURATION","embedding_model":s.embedding_model,"google_oauth":bool(s.google_client_id and s.google_client_secret),"github_oauth":bool(s.github_client_id and s.github_client_secret),"github_app":"ENABLED" if github_app.configured else "NEEDS_APP_ID_PRIVATE_KEY_INSTALLATION_ID_AND_WEBHOOK_SECRET","vision_ocr":"ENABLED" if s.google_cloud_vision_api_key else "GEMINI_PRIMARY_NO_VISION_FALLBACK","smtp":bool(s.smtp_host)}
+def integrations(u=Depends(roles("core_admin"))):return {"mongodb":"CONNECTED","gemini":"ENABLED" if s.gemini_api_key else "NEEDS_CONFIGURATION","embedding_model":s.gemini_embedding_model,"authentication":"INVITATION_AND_PASSWORD_ONLY","github_app":"ENABLED" if github_app.configured else "NEEDS_APP_ID_PRIVATE_KEY_INSTALLATION_ID_AND_WEBHOOK_SECRET","vision_ocr":"ENABLED" if s.google_cloud_vision_api_key else "GEMINI_PRIMARY_NO_VISION_FALLBACK","smtp":bool(s.smtp_host)}
 
 def repo_parts(url):
  path=urlparse(url).path.strip("/").removesuffix(".git").split("/")

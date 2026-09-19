@@ -21,7 +21,6 @@ import {
 import {
   ForgotPassword,
   InviteRegistration,
-  OAuthCallback,
   ResetPassword,
   RoleLanding,
   saveAuth,
@@ -130,15 +129,6 @@ export default function App() {
     [active, setActive] = useState("Overview"),
     [mobile, setMobile] = useState(false);
   const route = window.location.pathname;
-  if (route === "/oauth/callback")
-    return (
-      <OAuthCallback
-        onLogin={(a) => {
-          saveAuth(a, setAuth);
-          location.replace("/");
-        }}
-      />
-    );
   if (route.startsWith("/invite/"))
     return (
       <InviteRegistration
@@ -589,11 +579,7 @@ function People() {
   const [users, setUsers] = useState<User[]>([]),
     [inv, setInv] = useState<Invite[]>([]),
     [email, setEmail] = useState(""),
-    [role, setRole] = useState("student"),
-    [primary, setPrimary] = useState("Developer"),
-    [categories, setCategories] = useState("Developer"),
-    [skills, setSkills] = useState(""),
-    [capacity, setCapacity] = useState(5);
+    [role, setRole] = useState("student");
   const load = () =>
     Promise.all([api<User[]>("/users"), api<Invite[]>("/invitations")]).then(
       ([a, b]) => {
@@ -621,22 +607,6 @@ function People() {
               body: JSON.stringify({
                 email,
                 role,
-                primary_category: role === "core_reviewer" ? primary : null,
-                categories:
-                  role === "core_reviewer"
-                    ? categories
-                        .split(",")
-                        .map((x) => x.trim())
-                        .filter(Boolean)
-                    : [],
-                skills:
-                  role === "core_reviewer"
-                    ? skills
-                        .split(",")
-                        .map((x) => x.trim())
-                        .filter(Boolean)
-                    : [],
-                max_capacity: capacity,
               }),
             });
             setEmail("");
@@ -660,40 +630,6 @@ function People() {
           <option value="student">Student</option>
           <option value="core_reviewer">Core reviewer</option>
         </select>
-        {role === "core_reviewer" && (
-          <>
-            <select
-              value={primary}
-              onChange={(e) => setPrimary(e.target.value)}
-            >
-              <option>Developer</option>
-              <option>Tester</option>
-              <option>DevOps Engineer</option>
-              <option>Network Engineer</option>
-              <option>UI/UX Designer</option>
-              <option>Data Engineer</option>
-            </select>
-            <input
-              required
-              placeholder="Categories, comma separated"
-              value={categories}
-              onChange={(e) => setCategories(e.target.value)}
-            />
-            <input
-              required
-              placeholder="Skills: React, Java, AWS..."
-              value={skills}
-              onChange={(e) => setSkills(e.target.value)}
-            />
-            <input
-              type="number"
-              min="1"
-              max="50"
-              value={capacity}
-              onChange={(e) => setCapacity(Number(e.target.value))}
-            />
-          </>
-        )}
         <button className="primary">
           <Send />
           Send invitation
