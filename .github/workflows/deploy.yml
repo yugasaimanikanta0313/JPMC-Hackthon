@@ -65,8 +65,10 @@ jobs:
             fi
             git pull --ff-only origin master
             test -f .env
+            available_kb=$(df --output=avail / | tail -1)
+            test "$available_kb" -ge 2097152 || { echo "At least 2 GiB free disk is required before deployment"; exit 1; }
             docker compose -f docker-compose.prod.yml up -d ollama
-            docker compose -f docker-compose.prod.yml exec -T ollama ollama pull qwen2.5:3b
+            docker compose -f docker-compose.prod.yml exec -T ollama ollama pull qwen2.5:1.5b
             docker compose -f docker-compose.prod.yml up -d --build --remove-orphans
             docker image prune -f
             curl --fail --retry 12 --retry-delay 5 --retry-all-errors http://127.0.0.1/health

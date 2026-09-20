@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     aws_access_key_id: str = ""
     aws_secret_access_key: str = ""
     ollama_base_url: str = "http://localhost:11434"
-    ollama_model: str = "qwen2.5:3b"
+    ollama_model: str = "qwen2.5:1.5b"
     ollama_fallback_model: str = "qwen2.5:1.5b"
     ai_provider: str = "ollama"
     rag_min_confidence: float = 0.32
