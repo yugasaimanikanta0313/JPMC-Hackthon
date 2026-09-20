@@ -9,6 +9,7 @@ target/
 .venv/
 __pycache__/
 .pytest_cache/
+tmp/
 storage/local/*
 !storage/local/.gitkeep
 *.pem

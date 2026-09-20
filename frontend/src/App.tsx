@@ -27,8 +27,7 @@ import {
   saveAuth,
 } from "./AuthPages";
 import "./App.css";
-const API = import.meta.env.VITE_API_URL || "/api/v1",
-  AI = API;
+const API = import.meta.env.VITE_API_URL || "/api/v1";
 type User = { id: string; name: string; email: string; role: string };
 type Auth = { user: User; accessToken: string; refreshToken: string };
 type Project = {
@@ -105,18 +104,28 @@ const nav = [
   [FolderKanban, "Projects"],
   [Users, "People & invitations"],
   [MessageSquareMore, "Ask support"],
+  [BookOpen, "Requirements"],
+  [CheckCircle2, "Can I Continue?"],
+  [ShieldCheck, "Escalation status"],
   [MessageSquareMore, "Mentor queue"],
+  [ShieldCheck, "Decision ledger"],
+  [Search, "Issue intelligence"],
+  [LayoutDashboard, "Analytics"],
   [BookOpen, "Knowledge"],
   [ShieldCheck, "Administration"],
 ] as const;
 function navigationFor(role: string) {
   if (role === "student")
     return nav.filter((x) =>
-      ["Overview", "Projects", "Ask support", "Knowledge"].includes(x[1]),
+      ["Overview", "Projects", "Requirements", "Ask support", "Can I Continue?", "Escalation status", "Knowledge"].includes(x[1]),
     );
   if (role === "core_reviewer")
     return nav.filter((x) =>
-      ["Overview", "Projects", "Mentor queue", "Knowledge"].includes(x[1]),
+      ["Overview", "Projects", "Mentor queue", "Decision ledger", "Issue intelligence", "Analytics", "Knowledge"].includes(x[1]),
+    );
+  if (role === "core_admin")
+    return nav.filter((x) =>
+      ["Overview", "Projects", "People & invitations", "Mentor queue", "Decision ledger", "Issue intelligence", "Analytics", "Knowledge", "Administration"].includes(x[1]),
     );
   if (role === "CLIENT")
     return nav.filter((x) => ["Overview", "Projects"].includes(x[1]));
@@ -215,6 +224,7 @@ export default function App() {
           <button
             className="logout"
             onClick={() => {
+              void api("/auth/logout", { method: "POST" }).catch(() => undefined);
               sessionStorage.clear();
               setAuth(null);
             }}
@@ -234,6 +244,12 @@ function Page({ active, auth }: { active: string; auth: Auth }) {
   if (active === "People & invitations") return <People />;
   if (active === "Ask support") return <StudentTickets />;
   if (active === "Mentor queue") return <MentorQueue />;
+  if (active === "Requirements") return <RequirementsWorkspace />;
+  if (active === "Can I Continue?") return <ContinueWorkspace />;
+  if (active === "Escalation status") return <EscalationStatus />;
+  if (active === "Decision ledger") return <DecisionLedger />;
+  if (active === "Issue intelligence") return <IssueIntelligence />;
+  if (active === "Analytics") return <Analytics />;
   if (active === "Knowledge") return <Knowledge auth={auth} />;
   if (active === "Administration") return <Admin />;
   return <Overview auth={auth} />;
@@ -765,15 +781,48 @@ function MentorQueue() {
     </>
   );
 }
+function ProjectPicker({value,onChange}:{value:string;onChange:(id:string)=>void}) {
+  const [projects,setProjects]=useState<Project[]>([]);
+  useEffect(()=>{api<Project[]>("/projects").then((items)=>{setProjects(items);if(!value&&items[0])onChange(items[0].id)});},[]);
+  return <select value={value} onChange={(e)=>onChange(e.target.value)}><option value="">Select project</option>{projects.map((p)=><option value={p.id} key={p.id}>{p.name}</option>)}</select>;
+}
+function RequirementsWorkspace(){
+  const [project,setProject]=useState(""),[items,setItems]=useState<any[]>([]),[understanding,setUnderstanding]=useState(""),[result,setResult]=useState("");
+  useEffect(()=>{if(project)api<any[]>(`/projects/${project}/requirements`).then(setItems)},[project]);
+  return <><Heading over="REQUIREMENT INTELLIGENCE" title="Requirements & mismatch checker" copy="Read the stakeholder contract in plain English and verify your understanding before writing code."/><section className="panel"><ProjectPicker value={project} onChange={setProject}/>{items.map((x)=><div className="work-card" key={x.id}><div><b>{x.title||"Requirement"}</b><p>{x.text||x.description}</p><small>{x.status||"active"}</small></div></div>)}<textarea value={understanding} onChange={(e)=>setUnderstanding(e.target.value)} placeholder="Explain what you believe must be built"/><button className="primary" disabled={!project||!understanding} onClick={async()=>{const x=await api<any>(`/projects/${project}/requirements/check-understanding`,{method:"POST",body:JSON.stringify({requirement_id:items[0]?.id,understanding})});setResult(x.analysis)}}>Check my understanding</button>{result&&<div className="answer">{result}</div>}</section></>;
+}
+function ContinueWorkspace(){
+  const [project,setProject]=useState(""),[result,setResult]=useState<any>(null);
+  return <><Heading over="BLOCKER RESOLUTION" title="Can I Continue?" copy="Find parallel tasks that remain safe while a blocker or decision is waiting for core review."/><section className="panel"><ProjectPicker value={project} onChange={setProject}/><button className="primary" disabled={!project} onClick={async()=>setResult(await api(`/projects/${project}/continue-options`))}>Analyze task dependencies</button>{result&&<><div className="answer">{result.can_continue?"You can continue with the tasks below.":"No unblocked work is currently available."}</div>{result.suggested_unblocked_tasks?.map((x:any)=><div className="work-card" key={x.id}><div><b>{x.title}</b><p>{x.description}</p></div><em>{x.status}</em></div>)}</>}</section></>;
+}
+function EscalationStatus(){
+  const [project,setProject]=useState(""),[items,setItems]=useState<any[]>([]);
+  useEffect(()=>{if(project)api<any[]>(`/projects/${project}/escalations`).then(setItems)},[project]);
+  return <><Heading over="ASYNC SUPPORT" title="Escalation status" copy="Track structured packets sent to the core team and their verified resolutions."/><section className="panel"><ProjectPicker value={project} onChange={setProject}/>{items.length?items.map((x)=><div className="escalation" key={x.id}><div><span className="priority medium">{x.status}</span><h3>{x.question||x.title}</h3><p>{x.reason}</p>{x.response&&<div className="answer">{x.response}</div>}</div></div>):<Empty text="No escalations for this project."/>}</section></>;
+}
+function DecisionLedger(){
+  const [project,setProject]=useState(""),[items,setItems]=useState<any[]>([]);
+  const load=()=>project&&api<any[]>(`/projects/${project}/decisions`).then(setItems);
+  useEffect(()=>{void load()},[project]);
+  return <><Heading over="PROJECT SOURCE OF TRUTH" title="Decision ledger" copy="Only authorized core-team actions can confirm or reject architectural decisions."/><section className="panel"><ProjectPicker value={project} onChange={setProject}/>{items.map((x)=><div className="work-card" key={x.id}><div><b>{x.title||"Decision"}</b><p>{x.rationale||x.description}</p></div><em>{x.status||"proposed"}</em>{x.status!=="confirmed"&&<button className="secondary" onClick={async()=>{await api(`/decisions/${x.id}`,{method:"PATCH",body:JSON.stringify({status:"confirmed",title:x.title,rationale:x.rationale||x.description})});load()}}>Confirm</button>}</div>)}</section></>;
+}
+function IssueIntelligence(){
+ const [project,setProject]=useState(""),[clusters,setClusters]=useState<any[]>([]);
+ const load=async()=>{if(project)setClusters(await api(`/projects/${project}/issues/clusters`))};
+ return <><Heading over="LEARNING PATTERNS" title="Issue clusters" copy="Group duplicate questions and expose recurring cohort learning gaps."/><section className="panel"><ProjectPicker value={project} onChange={setProject}/><button className="primary" disabled={!project} onClick={async()=>{await api(`/projects/${project}/issues/recluster`,{method:"POST"});await load()}}><RefreshCw/>Recompute clusters</button>{clusters.map((x)=><div className="work-card" key={x.id}><div><b>{x.label}</b><p>{x.count} related questions</p></div></div>)}</section></>;
+}
+function Analytics(){
+ const [data,setData]=useState<any>(null);useEffect(()=>{Promise.all([api("/core/analytics/escalations"),api("/core/analytics/knowledge-reuse"),api("/core/analytics/recurring-issues")]).then(([e,k,r])=>setData({e,k,r}))},[]);
+ return <><Heading over="PLATFORM ANALYTICS" title="Mentoring impact" copy="Measure self-resolution, escalation turnaround, knowledge reuse, and recurring learning gaps."/><div className="stats"><article><span>AI self-resolution</span><strong>{data?.k?.self_resolution_rate??0}%</strong></article><article><span>Open escalations</span><strong>{data?.e?.open??0}</strong></article><article><span>Closed escalations</span><strong>{data?.e?.closed??0}</strong></article><article><span>Knowledge chunks</span><strong>{data?.k?.knowledge_chunks??0}</strong></article></div><section className="panel"><SectionTitle over="RECURRING" title="Learning gaps"/>{data?.r?.map((x:any)=><div className="work-card" key={x.id}><div><b>{x.label}</b><p>{x.count} occurrences</p></div></div>)}</section></>;
+}
 function Knowledge({ auth }: { auth: Auth }) {
   const [q, setQ] = useState(""),
     [result, setResult] = useState(""),
     [content, setContent] = useState(""),
-    [project, setProject] = useState("DEMO");
+    [project, setProject] = useState("");
   const ask = async () => {
-    const r = await fetch(AI + "/ask", {
+    const x = await api<any>("/ask", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         project_id: project,
         user_id: auth.user.id,
@@ -781,7 +830,6 @@ function Knowledge({ auth }: { auth: Auth }) {
         attempted_solutions: [],
       }),
     });
-    const x = await r.json();
     setResult(
       x.decision === "ANSWER"
         ? x.answer
@@ -798,11 +846,7 @@ function Knowledge({ auth }: { auth: Auth }) {
       <div className="page-grid">
         <section className="panel assistant light">
           <SectionTitle over="ASK" title="Evidence-backed guidance" />
-          <input
-            value={project}
-            onChange={(e) => setProject(e.target.value)}
-            placeholder="Project ID"
-          />
+          <ProjectPicker value={project} onChange={setProject} />
           <textarea
             value={q}
             onChange={(e) => setQ(e.target.value)}
@@ -823,9 +867,8 @@ function Knowledge({ auth }: { auth: Auth }) {
           className="panel ingest"
           onSubmit={async (e) => {
             e.preventDefault();
-            await fetch(AI + "/ingest", {
+            await api("/ingest", {
               method: "POST",
-              headers: { "Content-Type": "application/json" },
               body: JSON.stringify({
                 project_id: project,
                 document_id: crypto.randomUUID(),
@@ -844,7 +887,7 @@ function Knowledge({ auth }: { auth: Auth }) {
             onChange={(e) => setContent(e.target.value)}
             placeholder="Paste a requirement, mentor resolution, or project note"
           />
-          <button className="primary">
+          <button className="primary" disabled={!project || auth.user.role === "student"}>
             <BookOpen />
             Ingest knowledge
           </button>
@@ -1159,7 +1202,7 @@ function Admin() {
   useEffect(() => {
     Promise.all([
       api<Stats>("/analytics/overview"),
-      fetch(AI + "/integrations").then((r) => r.json()),
+      api("/integrations"),
     ]).then(([analytics, integrations]) => setS({ analytics, integrations }));
   }, []);
   return (

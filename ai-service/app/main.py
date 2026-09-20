@@ -42,7 +42,10 @@ def ph(x):return bcrypt.hashpw(x.encode(),bcrypt.gensalt()).decode()
 def token(u,t="access"):return jwt.encode({"sub":str(u["_id"]),"role":u["role"],"type":t,"exp":now()+(timedelta(minutes=s.jwt_access_minutes) if t=="access" else timedelta(days=s.jwt_refresh_days))},s.jwt_secret,algorithm="HS256")
 def auth(u):return {"user":clean(u),"accessToken":token(u),"refreshToken":token(u,"refresh")}
 def user(r:Request):
- try:p=jwt.decode(r.headers.get("authorization","").removeprefix("Bearer "),s.jwt_secret,algorithms=["HS256"]);u=db.users.find_one({"_id":oid(p["sub"]),"active":True})
+ try:
+  raw=r.headers.get("authorization","").removeprefix("Bearer ")
+  if db.revoked_tokens.find_one({"token_hash":digest(raw),"expires_at":{"$gt":now()}}):raise ValueError("revoked")
+  p=jwt.decode(raw,s.jwt_secret,algorithms=["HS256"]);u=db.users.find_one({"_id":oid(p["sub"]),"active":True})
  except:raise HTTPException(401,"Authentication required")
  if not u:raise HTTPException(401,"Account unavailable")
  return u
@@ -123,7 +126,10 @@ def start():
   if "project_vector_index" not in existing:db.document_chunks.create_search_index(SearchIndexModel(definition={"fields":[{"type":"vector","path":"embedding","numDimensions":384,"similarity":"cosine"},{"type":"filter","path":"project_id"}]},name="project_vector_index",type="vectorSearch"))
  except Exception:pass
 @app.get("/health")
-def health():return {"status":"UP","backend":"FastAPI","database":"MongoDB Atlas","gemini":bool(s.gemini_api_key)}
+def health():return {"status":"UP","backend":"FastAPI","database":"MongoDB Atlas","ai_provider":s.ai_provider,"ollama_model":s.ollama_model,"gemini_fallback":bool(s.gemini_api_key)}
+@app.post("/api/v1/ask")
+async def direct_ask(x:AskRequest,u=Depends(user)):
+ access(x.project_id,u);x.user_id=str(u["_id"]);return await rag.ask(x)
 @app.post("/api/v1/auth/login")
 def login(x:Login):
  u=db.users.find_one({"email":x.email.lower(),"active":True})
@@ -131,6 +137,17 @@ def login(x:Login):
  return auth(u)
 @app.get("/api/v1/auth/me")
 def me(u=Depends(user)):return clean(u)
+@app.post("/api/v1/auth/refresh")
+def refresh(x:dict):
+ try:p=jwt.decode(x.get("refreshToken") or x.get("refresh_token") or "",s.jwt_secret,algorithms=["HS256"])
+ except:raise HTTPException(401,"Refresh token invalid or expired")
+ if p.get("type")!="refresh":raise HTTPException(401,"Refresh token required")
+ u=db.users.find_one({"_id":oid(p["sub"]),"active":True})
+ if not u:raise HTTPException(401,"Account unavailable")
+ return {"accessToken":token(u),"refreshToken":token(u,"refresh")}
+@app.post("/api/v1/auth/logout",status_code=204)
+def logout(r:Request,u=Depends(user)):
+ raw=r.headers.get("authorization","").removeprefix("Bearer ");db.revoked_tokens.insert_one({"token_hash":digest(raw),"expires_at":now()+timedelta(minutes=s.jwt_access_minutes),"created_at":now()});return None
 @app.post("/api/v1/auth/forgot-password")
 def forgot(x:dict):
  u=db.users.find_one({"email":x.get("email","").lower()})
@@ -175,9 +192,22 @@ def revoke(iid:str,u=Depends(roles("core_admin"))):db.invitations.update_one({"_
 
 @app.get("/api/v1/users")
 def users(u=Depends(roles("core_admin"))):return clean(list(db.users.find()))
+@app.patch("/api/v1/users/me")
+async def update_me(r:Request,u=Depends(user)):
+ b=await r.json();allowed={k:b[k] for k in ("name","timezone","preferences") if k in b};allowed["updated_at"]=now();db.users.update_one({"_id":u["_id"]},{"$set":allowed});return clean(db.users.find_one({"_id":u["_id"]}))
+@app.get("/api/v1/users/{uid}")
+def get_user(uid:str,u=Depends(roles("core_reviewer","core_admin"))):
+ target=db.users.find_one({"_id":oid(uid)})
+ if not target:raise HTTPException(404,"User not found")
+ return clean(target)
 @app.get("/api/v1/projects")
 def projects(u=Depends(user)):
  ids=[oid(v["project_id"]) for v in db.project_members.find({"user_id":str(u["_id"]),"active":True})];return clean(list(db.projects.find({} if u["role"]=="core_admin" else {"_id":{"$in":ids}})))
+@app.get("/api/v1/projects/{pid}")
+def get_project(pid:str,u=Depends(user)):
+ access(pid,u);p=db.projects.find_one({"_id":oid(pid)})
+ if not p:raise HTTPException(404,"Project not found")
+ p["metrics"]={"requirements":db.requirements.count_documents({"project_id":pid}),"tasks":db.tasks.count_documents({"project_id":pid}),"open_escalations":db.escalations.count_documents({"project_id":pid,"status":{"$in":["open","claimed"]}})};return clean(p)
 @app.post("/api/v1/projects")
 def project(x:Project,u=Depends(roles("student","core_admin"))):
  d={**x.model_dump(),"status":"active","health":100,"created_by":str(u["_id"]),"student_editable":u["role"]=="student","created_at":now(),"updated_at":now()};r=db.projects.insert_one(d);d["_id"]=r.inserted_id
@@ -211,11 +241,202 @@ def delete_project(pid:str,u=Depends(roles("student","core_admin"))):
  return None
 @app.post("/api/v1/projects/{pid}/members")
 def member(pid:str,x:dict,u=Depends(roles("core_admin"))):db.project_members.update_one({"project_id":pid,"user_id":x["user_id"]},{"$set":{**x,"project_id":pid,"active":True}},upsert=True);return {"status":"added"}
+@app.get("/api/v1/projects/{pid}/members")
+def members(pid:str,u=Depends(user)):access(pid,u);return clean(list(db.project_members.find({"project_id":pid,"active":True})))
+@app.delete("/api/v1/projects/{pid}/members/{uid}",status_code=204)
+def remove_member(pid:str,uid:str,u=Depends(roles("core_admin"))):db.project_members.update_one({"project_id":pid,"user_id":uid},{"$set":{"active":False,"updated_at":now()}});return None
 def routes(name):
  async def ls(pid:str,u=Depends(user)):access(pid,u);return clean(list(db[name].find({"project_id":pid}).sort("created_at",-1)))
- async def add(pid:str,r:Request,u=Depends(user)):access(pid,u);d=await r.json();d.update({"project_id":pid,"created_by":str(u["_id"]),"created_at":now()});z=db[name].insert_one(d);d["_id"]=z.inserted_id;return clean(d)
+ async def add(pid:str,r:Request,u=Depends(user)):
+  access(pid,u);d=await r.json();d.update({"project_id":pid,"created_by":str(u["_id"]),"created_at":now()})
+  if name=="questions":
+   if u["role"]!="student":raise HTTPException(403,"Only students submit guidance questions")
+   result=await rag.ask(AskRequest(project_id=pid,user_id=str(u["_id"]),question=d.get("question") or d.get("title", ""),mode=d.get("mode"),conversation_id=d.get("conversation_id"),attempted_solutions=d.get("attempted_solutions",[]),context_overrides=d.get("context_overrides",{})));d.update({"mode":result.mode,"ai_response":result.model_dump(),"status":"needs_escalation" if result.needs_escalation else "guidance_ready"})
+  elif name=="knowledge" and u["role"] not in {"core_reviewer","core_admin"}:raise HTTPException(403,"Only the core team publishes verified knowledge")
+  elif name=="escalations" and u["role"]!="student":raise HTTPException(403,"Only students submit escalations")
+  elif name=="decisions":d.update({"status":"proposed","proposed_by":str(u["_id"])})
+  elif name=="requirements":d.update({"status":d.get("status","draft"),"version":d.get("version",1)})
+  elif name=="tasks":d.update({"status":d.get("status","todo"),"prerequisite_task_ids":d.get("prerequisite_task_ids",[])})
+  z=db[name].insert_one(d);d["_id"]=z.inserted_id
+  if name=="knowledge":chunk_document(db,pid,f"knowledge:{z.inserted_id}",d.get("title","Knowledge"),d.get("content") or d.get("description", ""),"knowledge",True,verification_status="core_team_verified" if u["role"]!="student" else "student_provided",access_scope="project")
+  return clean(d)
  app.add_api_route(f"/api/v1/projects/{{pid}}/{name}",ls,methods=["GET"],name="list_"+name);app.add_api_route(f"/api/v1/projects/{{pid}}/{name}",add,methods=["POST"],name="add_"+name)
 for c in ["requirements","documents","questions","decisions","escalations","knowledge","issues","tasks"]:routes(c)
+
+# Master contract detail routes and workflow engines.
+def owned(collection,item_id,u):
+ item=collection.find_one({"_id":oid(item_id)})
+ if not item:raise HTTPException(404,"Record not found")
+ access(item["project_id"],u);return item
+@app.get("/api/v1/requirements/{rid}")
+def requirement_detail(rid:str,u=Depends(user)):return clean(owned(db.requirements,rid,u))
+@app.patch("/api/v1/requirements/{rid}")
+async def requirement_update(rid:str,r:Request,u=Depends(roles("core_reviewer","core_admin"))):
+ item=owned(db.requirements,rid,u);b=await r.json();previous={k:item.get(k) for k in ("title","text","status","acceptance_criteria","affected_components")};db.requirement_versions.insert_one({"project_id":item["project_id"],"requirement_id":rid,"snapshot":previous,"changed_by":str(u["_id"]),"created_at":now()});b["updated_at"]=now();db.requirements.update_one({"_id":item["_id"]},{"$set":b});return clean(db.requirements.find_one({"_id":item["_id"]}))
+@app.post("/api/v1/requirements/{rid}/analyze")
+async def requirement_analyze(rid:str,u=Depends(user)):
+ item=owned(db.requirements,rid,u);text=item.get("text") or item.get("description") or "";prompt=f"Convert this client requirement into plain English. Return a concise summary, missing details, acceptance criteria, and affected components. Requirement: {text}"
+ try:analysis,_=await rag.gateway.generate_text(prompt)
+ except Exception:analysis="AI analysis unavailable; core review required."
+ db.requirements.update_one({"_id":item["_id"]},{"$set":{"analysis":analysis,"updated_at":now()}});return {"analysis":analysis}
+@app.post("/api/v1/projects/{pid}/requirements/check-understanding")
+async def check_understanding(pid:str,r:Request,u=Depends(roles("student"))):
+ access(pid,u);b=await r.json();rid=b.get("requirement_id");req=db.requirements.find_one({"_id":oid(rid),"project_id":pid}) if rid else db.requirements.find_one({"project_id":pid,"status":{"$in":["confirmed","active","changed"]}})
+ if not req:raise HTTPException(404,"Requirement not found")
+ prompt=f"Compare the client requirement with the student's understanding. Identify exact omissions, contradictions, and safe next steps. REQUIREMENT: {req.get('text') or req.get('description')} STUDENT: {b.get('understanding','')}"
+ try:analysis,_=await rag.gateway.generate_text(prompt)
+ except Exception:analysis="Automated comparison unavailable; request core review."
+ conflict=any(word in analysis.lower() for word in ("conflict","contradict","missing","omit"));record={"project_id":pid,"requirement_id":str(req["_id"]),"student_id":str(u["_id"]),"understanding":b.get("understanding"),"analysis":analysis,"mismatch":conflict,"created_at":now()};z=db.understanding_checks.insert_one(record);record["_id"]=z.inserted_id;return clean(record)
+@app.post("/api/v1/projects/{pid}/requirements/compare")
+async def compare_requirement(pid:str,r:Request,u=Depends(roles("core_reviewer","core_admin"))):
+ access(pid,u);b=await r.json();current="\n".join((x.get("text") or x.get("description") or "") for x in db.requirements.find({"project_id":pid,"status":{"$ne":"deprecated"}}));prompt=f"Compare existing requirements against the new client communication. List changes, conflicts, and impacted components. EXISTING: {current} NEW: {b.get('communication','')}"
+ try:analysis,_=await rag.gateway.generate_text(prompt)
+ except Exception:analysis="Automated impact analysis unavailable."
+ return {"analysis":analysis,"requires_core_decision":True}
+
+@app.get("/api/v1/documents/{did}")
+def document_detail(did:str,u=Depends(user)):return clean(owned(db.documents,did,u))
+@app.get("/api/v1/documents/{did}/status")
+def document_status(did:str,u=Depends(user)):
+ item=owned(db.documents,did,u);return {"document_id":did,"status":item.get("index_status","indexed"),"chunks":db.document_chunks.count_documents({"document_id":did})}
+@app.delete("/api/v1/documents/{did}",status_code=204)
+def document_delete(did:str,u=Depends(roles("core_reviewer","core_admin"))):
+ item=owned(db.documents,did,u);db.document_chunks.delete_many({"project_id":item["project_id"],"document_id":did});db.documents.delete_one({"_id":item["_id"]});return None
+@app.post("/api/v1/documents/{did}/reindex")
+def document_reindex(did:str,u=Depends(roles("core_reviewer","core_admin"))):
+ item=owned(db.documents,did,u);count=chunk_document(db,item["project_id"],did,item.get("title","Document"),item.get("content",""),item.get("source_type","document"),True,verification_status="core_reindexed",access_scope="project");return {"status":"indexed","chunks":count}
+
+@app.get("/api/v1/questions/{qid}")
+def question_detail(qid:str,u=Depends(user)):return clean(owned(db.questions,qid,u))
+@app.post("/api/v1/questions/{qid}/attempts")
+async def question_attempt(qid:str,r:Request,u=Depends(roles("student"))):
+ q=owned(db.questions,qid,u);b=await r.json();attempt={"project_id":q["project_id"],"question_id":qid,"student_id":str(u["_id"]),"content":b.get("content") or b.get("attempt"),"created_at":now()};result=await rag.ask(AskRequest(project_id=q["project_id"],user_id=str(u["_id"]),question=q.get("question") or q.get("title",""),mode="GUIDE",attempted_solutions=[attempt["content"]]));attempt["evaluation"]=result.model_dump();z=db.question_attempts.insert_one(attempt);attempt["_id"]=z.inserted_id;return clean(attempt)
+@app.post("/api/v1/questions/{qid}/continue")
+def question_continue(qid:str,u=Depends(roles("student"))):
+ q=owned(db.questions,qid,u);tasks=list(db.tasks.find({"project_id":q["project_id"],"status":{"$in":["todo","in_progress"]}}));blocked={str(v) for t in db.tasks.find({"project_id":q["project_id"],"status":{"$ne":"done"}}) for v in t.get("blocks",[])};return clean({"can_continue":True,"suggested_unblocked_tasks":[t for t in tasks if str(t["_id"]) not in blocked]})
+@app.post("/api/v1/questions/{qid}/feedback")
+async def question_feedback(qid:str,r:Request,u=Depends(roles("student"))):q=owned(db.questions,qid,u);b=await r.json();db.questions.update_one({"_id":q["_id"]},{"$set":{"feedback":b,"updated_at":now()}});return {"status":"recorded"}
+@app.post("/api/v1/questions/{qid}/escalate")
+async def question_escalate(qid:str,r:Request,u=Depends(roles("student"))):
+ q=owned(db.questions,qid,u);b=await r.json();d={"project_id":q["project_id"],"student_id":str(u["_id"]),"question_id":qid,"question":q.get("question") or q.get("title"),"reason":b.get("reason","Student requested core review"),"status":"open","packet":{"attempts":clean(list(db.question_attempts.find({"question_id":qid}))),"exact_decision_required":b.get("exact_decision_required")},"created_at":now()};z=db.escalations.insert_one(d);d["_id"]=z.inserted_id;return clean(d)
+@app.get("/api/v1/questions/{qid}/similar")
+def similar_questions(qid:str,u=Depends(user)):
+ q=owned(db.questions,qid,u);terms=set((q.get("question") or q.get("title","")).lower().split());rows=[]
+ for item in db.questions.find({"project_id":q["project_id"],"_id":{"$ne":q["_id"]}}).limit(100):
+  score=len(terms&set((item.get("question") or item.get("title","")).lower().split()))/max(len(terms),1)
+  if score>.2:rows.append({**clean(item),"similarity":score})
+ return sorted(rows,key=lambda x:x["similarity"],reverse=True)[:10]
+
+@app.get("/api/v1/decisions/{did}")
+def decision_detail(did:str,u=Depends(user)):return clean(owned(db.decisions,did,u))
+@app.patch("/api/v1/decisions/{did}")
+async def decision_update(did:str,r:Request,u=Depends(roles("core_reviewer","core_admin"))):
+ item=owned(db.decisions,did,u);b=await r.json();status=b.get("status",item.get("status","proposed"))
+ if status not in {"proposed","confirmed","rejected","superseded"}:raise HTTPException(400,"Invalid decision status")
+ b.update({"status":status,"confirmed_by":str(u["_id"]) if status=="confirmed" else None,"updated_at":now()});db.decisions.update_one({"_id":item["_id"]},{"$set":b});db.audit_logs.insert_one({"action":"DECISION_"+status.upper(),"project_id":item["project_id"],"entity_id":did,"actor_id":str(u["_id"]),"created_at":now()})
+ if status=="confirmed":chunk_document(db,item["project_id"],f"decision:{did}",b.get("title",item.get("title","Confirmed decision")),b.get("rationale",item.get("rationale",item.get("description",""))),"decision",True,verification_status="human_confirmed",access_scope="project")
+ return clean(db.decisions.find_one({"_id":item["_id"]}))
+@app.post("/api/v1/decisions/{did}/conflicts/check")
+async def decision_conflict(did:str,r:Request,u=Depends(user)):
+ item=owned(db.decisions,did,u);b=await r.json();result=await rag.ask(AskRequest(project_id=item["project_id"],user_id=str(u["_id"]),question=f"Check this proposed change against decision {item.get('title')}: {b.get('proposed_change','')}",mode="DECISION"));return result
+@app.get("/api/v1/escalations/{eid}")
+def escalation_detail(eid:str,u=Depends(user)):return clean(owned(db.escalations,eid,u))
+@app.patch("/api/v1/escalations/{eid}")
+async def escalation_update(eid:str,r:Request,u=Depends(user)):
+ item=owned(db.escalations,eid,u)
+ if u["role"]=="student" and item.get("student_id")!=str(u["_id"]):raise HTTPException(403,"Not your escalation")
+ if item.get("status") not in {"draft","open"}:raise HTTPException(409,"Only draft/open escalation can be edited")
+ b=await r.json();b["updated_at"]=now();db.escalations.update_one({"_id":item["_id"]},{"$set":b});return clean(db.escalations.find_one({"_id":item["_id"]}))
+@app.post("/api/v1/escalations/{eid}/submit")
+def escalation_submit(eid:str,u=Depends(roles("student"))):
+ item=owned(db.escalations,eid,u);db.escalations.update_one({"_id":item["_id"]},{"$set":{"status":"open","submitted_at":now()}});notify_reviewer_team(eid,item.get("question","Escalation"),item.get("specialty","Developer"));return {"status":"open"}
+@app.post("/api/v1/escalations/{eid}/withdraw")
+def escalation_withdraw(eid:str,u=Depends(roles("student"))):
+ item=owned(db.escalations,eid,u)
+ if item.get("student_id")!=str(u["_id"]):raise HTTPException(403,"Not your escalation")
+ db.escalations.update_one({"_id":item["_id"]},{"$set":{"status":"withdrawn","updated_at":now()}});return {"status":"withdrawn"}
+@app.get("/api/v1/core/queue/{eid}")
+def core_queue_detail(eid:str,u=Depends(roles("core_reviewer","core_admin"))):return clean(owned(db.escalations,eid,u))
+@app.post("/api/v1/core/escalations/{eid}/request-info")
+async def request_info(eid:str,r:Request,u=Depends(roles("core_reviewer","core_admin"))):
+ item=owned(db.escalations,eid,u);b=await r.json();db.escalations.update_one({"_id":item["_id"]},{"$set":{"status":"awaiting_student_info","info_request":b.get("message"),"handled_by":str(u["_id"]),"updated_at":now()}});db.notifications.insert_one({"user_id":item.get("student_id"),"type":"ESCALATION_INFO_REQUESTED","escalation_id":eid,"message":b.get("message"),"read":False,"created_at":now()});return {"status":"awaiting_student_info"}
+
+@app.get("/api/v1/knowledge/{kid}")
+def knowledge_detail(kid:str,u=Depends(user)):return clean(owned(db.knowledge,kid,u))
+@app.post("/api/v1/knowledge/{kid}/feedback")
+async def knowledge_feedback(kid:str,r:Request,u=Depends(user)):
+ item=owned(db.knowledge,kid,u);b=await r.json();helpful=bool(b.get("helpful"));db.knowledge_feedback.update_one({"knowledge_id":kid,"user_id":str(u["_id"])},{"$set":{"project_id":item["project_id"],"helpful":helpful,"comment":b.get("comment"),"updated_at":now()}},upsert=True);return {"status":"recorded"}
+@app.post("/api/v1/projects/{pid}/knowledge/search")
+async def knowledge_search(pid:str,r:Request,u=Depends(user)):
+ access(pid,u);b=await r.json();matches=rag.retriever.search(pid,b.get("query",""),limit=min(int(b.get("limit",10)),25));return clean([{"document_id":c.document_id,"title":c.title,"content":c.content,"score":score,"metadata":c.metadata} for c,score in matches])
+
+def build_clusters(pid):
+ questions=list(db.questions.find({"project_id":pid}))+list(db.tickets.find({"project_id":pid}));groups={}
+ for q in questions:
+  text=(q.get("question") or q.get("title") or "").lower();key=" ".join(sorted({w for w in text.split() if len(w)>4})[:5]) or "uncategorized";groups.setdefault(key,[]).append(q)
+ db.issue_clusters.delete_many({"project_id":pid});records=[]
+ for key,items in groups.items():
+  if len(items)>1:records.append({"project_id":pid,"label":key,"count":len(items),"question_ids":[str(x["_id"]) for x in items],"status":"active","created_at":now()})
+ if records:db.issue_clusters.insert_many(records)
+ return records
+@app.get("/api/v1/projects/{pid}/issues/clusters")
+def issue_clusters(pid:str,u=Depends(roles("core_reviewer","core_admin"))):access(pid,u);return clean(list(db.issue_clusters.find({"project_id":pid}).sort("count",-1)))
+@app.get("/api/v1/issue-clusters/{cid}")
+def issue_cluster(cid:str,u=Depends(roles("core_reviewer","core_admin"))):return clean(owned(db.issue_clusters,cid,u))
+@app.post("/api/v1/projects/{pid}/issues/recluster")
+def issue_recluster(pid:str,u=Depends(roles("core_reviewer","core_admin"))):access(pid,u);records=build_clusters(pid);return {"status":"complete","clusters":len(records)}
+@app.get("/api/v1/projects/{pid}/issues/recurring")
+def recurring_issues(pid:str,u=Depends(roles("core_reviewer","core_admin"))):access(pid,u);return clean(list(db.issue_clusters.find({"project_id":pid,"count":{"$gte":2}}).sort("count",-1)))
+
+@app.get("/api/v1/tasks/{tid}")
+def task_detail(tid:str,u=Depends(user)):return clean(owned(db.tasks,tid,u))
+@app.patch("/api/v1/tasks/{tid}")
+async def task_update(tid:str,r:Request,u=Depends(user)):
+ item=owned(db.tasks,tid,u);b=await r.json()
+ if b.get("status") and b["status"] not in {"todo","in_progress","blocked","done"}:raise HTTPException(400,"Invalid task status")
+ b["updated_at"]=now();db.tasks.update_one({"_id":item["_id"]},{"$set":b});return clean(db.tasks.find_one({"_id":item["_id"]}))
+@app.post("/api/v1/tasks/{tid}/dependencies")
+async def task_dependencies(tid:str,r:Request,u=Depends(user)):
+ item=owned(db.tasks,tid,u);b=await r.json();dependency_id=b.get("task_id")
+ if not db.tasks.find_one({"_id":oid(dependency_id),"project_id":item["project_id"]}):raise HTTPException(404,"Dependency task not found")
+ db.tasks.update_one({"_id":item["_id"]},{"$addToSet":{"prerequisite_task_ids":dependency_id},"$set":{"updated_at":now()}});return {"status":"added"}
+@app.get("/api/v1/tasks/{tid}/blockers")
+def task_blockers(tid:str,u=Depends(user)):
+ item=owned(db.tasks,tid,u);ids=[oid(x) for x in item.get("prerequisite_task_ids",[])];return clean(list(db.tasks.find({"_id":{"$in":ids},"status":{"$ne":"done"}})))
+@app.get("/api/v1/projects/{pid}/continue-options")
+def continue_options(pid:str,u=Depends(roles("student"))):
+ access(pid,u);tasks=list(db.tasks.find({"project_id":pid,"status":{"$in":["todo","in_progress"]}}));result=[]
+ for task_doc in tasks:
+  prerequisites=[oid(x) for x in task_doc.get("prerequisite_task_ids",[])];blocked=bool(prerequisites and db.tasks.find_one({"_id":{"$in":prerequisites},"status":{"$ne":"done"}}))
+  if not blocked:result.append(task_doc)
+ return clean({"can_continue":bool(result),"suggested_unblocked_tasks":result})
+
+@app.get("/api/v1/jobs/{jid}")
+def job_status(jid:str,u=Depends(user)):return clean(owned(db.jobs,jid,u))
+def reindex_project(pid,u):
+ access(pid,u);job={"project_id":pid,"type":"reindex","status":"running","created_by":str(u["_id"]),"created_at":now()};z=db.jobs.insert_one(job);job["_id"]=z.inserted_id
+ try:
+  project_doc=db.projects.find_one({"_id":oid(pid)});count=chunk_document(db,pid,f"project:{pid}",project_doc.get("name","Project"),"\n".join([project_doc.get("summary",""),project_doc.get("requirement_analysis","")]),"requirements",True,verification_status="project_owner",access_scope="project");db.jobs.update_one({"_id":z.inserted_id},{"$set":{"status":"complete","chunks":count,"completed_at":now()}})
+ except Exception as exc:db.jobs.update_one({"_id":z.inserted_id},{"$set":{"status":"failed","error":str(exc),"completed_at":now()}})
+ return clean(db.jobs.find_one({"_id":z.inserted_id}))
+@app.post("/api/v1/projects/{pid}/rebuild-context")
+def rebuild_context(pid:str,u=Depends(roles("core_reviewer","core_admin"))):return reindex_project(pid,u)
+@app.post("/api/v1/projects/{pid}/reindex")
+def reindex(pid:str,u=Depends(roles("core_reviewer","core_admin"))):return reindex_project(pid,u)
+
+def project_metrics(pid):
+ tickets=db.tickets.count_documents({"project_id":pid});resolved=db.tickets.count_documents({"project_id":pid,"status":"CLOSED"});ai=db.tickets.count_documents({"project_id":pid,"ai_resolution.status":"RESOLVED_BY_AI"});return {"tickets":tickets,"resolved":resolved,"open":tickets-resolved,"self_resolution_rate":round(ai/max(tickets,1)*100,1),"knowledge_items":db.knowledge.count_documents({"project_id":pid})}
+@app.get("/api/v1/projects/{pid}/analytics/overview")
+def project_analytics(pid:str,u=Depends(user)):access(pid,u);return project_metrics(pid)
+@app.get("/api/v1/projects/{pid}/analytics/issues")
+def project_issue_analytics(pid:str,u=Depends(roles("core_reviewer","core_admin"))):access(pid,u);return {"by_category":list(db.tickets.aggregate([{"$match":{"project_id":pid}},{"$group":{"_id":"$category","count":{"$sum":1}}},{"$sort":{"count":-1}}])),"clusters":clean(list(db.issue_clusters.find({"project_id":pid}).sort("count",-1)))}
+@app.get("/api/v1/core/analytics/recurring-issues")
+def recurring_analytics(u=Depends(roles("core_reviewer","core_admin"))):return clean(list(db.issue_clusters.find({"count":{"$gte":2}}).sort("count",-1).limit(50)))
+@app.get("/api/v1/core/analytics/escalations")
+def escalation_analytics(u=Depends(roles("core_reviewer","core_admin"))):return {"open":db.escalations.count_documents({"status":{"$in":["open","claimed"]}}),"closed":db.escalations.count_documents({"status":{"$in":["resolved","closed"]}})}
+@app.get("/api/v1/core/analytics/knowledge-reuse")
+def knowledge_reuse(u=Depends(roles("core_reviewer","core_admin"))):
+ total=db.tickets.count_documents({});ai=db.tickets.count_documents({"ai_resolution.status":"RESOLVED_BY_AI"});return {"tickets":total,"ai_resolved":ai,"self_resolution_rate":round(ai/max(total,1)*100,1),"knowledge_chunks":db.document_chunks.count_documents({"verified":True})}
 
 MAX_UPLOAD_BYTES=50*1024*1024
 ALLOWED_UPLOADS={".png",".jpg",".jpeg",".webp",".gif",".txt",".md",".pdf",".zip",".py",".js",".jsx",".ts",".tsx",".java",".json",".yaml",".yml",".log",".html",".css",".sql"}
@@ -328,11 +549,16 @@ def queue(u=Depends(roles("core_reviewer","core_admin"))):
  if u["role"]!="core_admin":
   profile=db.mentor_profiles.find_one({"user_id":str(u["_id"])}) or {};q["specialty"]={"$in":profile.get("categories",[profile.get("primary_category")])}
  return clean(list(db.escalations.find(q).sort("created_at",1)))
-@app.post("/api/v1/core/escalations/{eid}/{action}")
-def ticket(eid:str,action:str,x:dict={},u=Depends(roles("core_reviewer","core_admin"))):
- status={"claim":"claimed","respond":"resolved","close":"closed"}.get(action)
- if not status:raise HTTPException(404)
- db.escalations.update_one({"_id":oid(eid)},{"$set":{"status":status,"response":x.get("response"),"handled_by":str(u["_id"]),"updated_at":now()}});return {"status":status}
+def update_core_escalation(eid,status,x,u):
+ item=db.escalations.find_one({"_id":oid(eid)})
+ if not item:raise HTTPException(404,"Escalation not found")
+ db.escalations.update_one({"_id":item["_id"]},{"$set":{"status":status,"response":x.get("response"),"handled_by":str(u["_id"]),"updated_at":now()}});return {"status":status}
+@app.post("/api/v1/core/escalations/{eid}/claim")
+def claim_core_escalation(eid:str,x:dict={},u=Depends(roles("core_reviewer","core_admin"))):return update_core_escalation(eid,"claimed",x,u)
+@app.post("/api/v1/core/escalations/{eid}/respond")
+def respond_core_escalation(eid:str,x:dict={},u=Depends(roles("core_reviewer","core_admin"))):return update_core_escalation(eid,"resolved",x,u)
+@app.post("/api/v1/core/escalations/{eid}/close")
+def close_core_escalation(eid:str,x:dict={},u=Depends(roles("core_reviewer","core_admin"))):return update_core_escalation(eid,"closed",x,u)
 @app.post("/api/v1/escalations/{eid}/resolve")
 def resolve_escalation(eid:str,x:dict,u=Depends(roles("core_reviewer","core_admin"))):
  escalation=db.escalations.find_one({"_id":oid(eid)})
@@ -354,7 +580,7 @@ def ingest(x:IngestRequest,u=Depends(roles("core_reviewer","core_admin"))):
 @app.get("/api/v1/analytics/overview")
 def analytics(u=Depends(roles("core_reviewer","core_admin"))):return {"activeProjects":db.projects.count_documents({"status":"active"}),"users":db.users.count_documents({}),"openEscalations":db.escalations.count_documents({"status":{"$in":["open","claimed"]}}),"resolvedEscalations":db.escalations.count_documents({"status":{"$in":["resolved","closed"]}})}
 @app.get("/api/v1/integrations")
-def integrations(u=Depends(roles("core_admin"))):return {"mongodb":"CONNECTED","gemini":"ENABLED" if s.gemini_api_key else "NEEDS_CONFIGURATION","embedding_model":s.gemini_embedding_model,"authentication":"INVITATION_AND_PASSWORD_ONLY","github_app":"ENABLED" if github_app.configured else "NEEDS_APP_ID_PRIVATE_KEY_INSTALLATION_ID_AND_WEBHOOK_SECRET","vision_ocr":"ENABLED" if s.google_cloud_vision_api_key else "GEMINI_PRIMARY_NO_VISION_FALLBACK","smtp":bool(s.smtp_host)}
+def integrations(u=Depends(roles("core_admin"))):return {"mongodb":"CONNECTED","ai_provider":s.ai_provider,"ollama_model":s.ollama_model,"gemini":"ENABLED_FALLBACK" if s.gemini_api_key else "NEEDS_CONFIGURATION","embedding_model":s.gemini_embedding_model,"authentication":"INVITATION_AND_PASSWORD_ONLY","github_app":"ENABLED" if github_app.configured else "NEEDS_APP_ID_PRIVATE_KEY_INSTALLATION_ID_AND_WEBHOOK_SECRET","vision_ocr":"ENABLED" if s.google_cloud_vision_api_key else "GEMINI_PRIMARY_NO_VISION_FALLBACK","smtp":bool(s.smtp_host)}
 
 def repo_parts(url):
  path=urlparse(url).path.strip("/").removesuffix(".git").split("/")

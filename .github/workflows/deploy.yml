@@ -22,6 +22,8 @@ jobs:
       - run: pip install -r ai-service/requirements.txt
       - run: python -m py_compile app/main.py app/rag/rag_service.py app/retrieval/hybrid_retriever.py app/services/github_app.py app/services/ingestion.py
         working-directory: ai-service
+      - run: pytest -q
+        working-directory: ai-service
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -61,6 +63,8 @@ jobs:
             fi
             git pull --ff-only origin master
             test -f .env
+            docker compose -f docker-compose.prod.yml up -d ollama
+            docker compose -f docker-compose.prod.yml exec -T ollama ollama pull qwen2.5:3b
             docker compose -f docker-compose.prod.yml up -d --build --remove-orphans
             docker image prune -f
             curl --fail --retry 12 --retry-delay 5 --retry-all-errors http://127.0.0.1/health
