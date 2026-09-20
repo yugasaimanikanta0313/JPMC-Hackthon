@@ -24,6 +24,8 @@ jobs:
         working-directory: ai-service
       - run: pytest -q
         working-directory: ai-service
+        env:
+          PYTHONPATH: .
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
